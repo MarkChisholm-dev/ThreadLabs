@@ -1,42 +1,319 @@
 import "dotenv/config";
 import express from "express";
 import cors from "cors";
+import helmet from "helmet";
+import rateLimit from "express-rate-limit";
 import multer from "multer";
 import path from "node:path";
 import fs from "node:fs";
-import { fileURLToPath } from "node:url";
+import { fileURLToPath, pathToFileURL } from "node:url";
 import { v4 as uuidv4 } from "uuid";
+import { z } from "zod";
 
-import { DEFAULT_CONFIG, readDb, writeDb } from "./db.js";
-import { getImageEmbedding } from "./embedding.js";
+import { DEFAULT_CONFIG, mutateDb, readDb } from "./db.js";
+import { getEmbeddingMetadata, getImageEmbedding } from "./embedding.js";
 import { getWeatherByLocation } from "./weather.js";
 import { buildSuggestions } from "./suggestions.js";
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
+const UPLOAD_DIR = process.env.UPLOAD_DIR
+  ? path.resolve(process.env.UPLOAD_DIR)
+  : path.resolve(__dirname, "..", "uploads");
+const ALLOWED_EXTENSIONS = new Set([".jpg", ".jpeg", ".png", ".webp"]);
+const ALLOWED_MIME_TYPES = new Set(["image/jpeg", "image/png", "image/webp"]);
+
+fs.mkdirSync(UPLOAD_DIR, { recursive: true });
+
+class HttpError extends Error {
+  constructor(status, message) {
+    super(message);
+    this.status = status;
+  }
+}
 
 const app = express();
 const PORT = Number(process.env.PORT || 4000);
+const OLLAMA_ENABLED = String(process.env.OLLAMA_ENABLED || "false").toLowerCase() === "true";
+const OLLAMA_BASE_URL = String(process.env.OLLAMA_BASE_URL || "http://127.0.0.1:11434").replace(/\/$/, "");
+const OLLAMA_MODEL = String(process.env.OLLAMA_MODEL || "llama3.1:8b");
+const OLLAMA_TIMEOUT_MS = Number(process.env.OLLAMA_TIMEOUT_MS || 30000);
+const allowedOrigins = (process.env.CORS_ORIGINS || "")
+  .split(",")
+  .map((value) => value.trim())
+  .filter(Boolean);
+const corsOriginList =
+  allowedOrigins.length > 0
+    ? allowedOrigins
+    : [
+        "http://localhost:5173",
+        "http://127.0.0.1:5173",
+        "http://localhost:4173",
+        "http://127.0.0.1:4173",
+      ];
+
 const upload = multer({
   storage: multer.diskStorage({
-    destination: path.resolve(__dirname, "..", "uploads"),
+    destination: UPLOAD_DIR,
     filename: (_req, file, cb) => {
-      const ext = path.extname(file.originalname) || ".jpg";
+      const ext = path.extname(file.originalname || "").toLowerCase() || ".jpg";
       cb(null, `${Date.now()}-${uuidv4()}${ext}`);
     },
   }),
   limits: {
     fileSize: 8 * 1024 * 1024,
   },
+  fileFilter: (_req, file, cb) => {
+    const ext = path.extname(file.originalname || "").toLowerCase();
+    if (!ALLOWED_MIME_TYPES.has(file.mimetype) || !ALLOWED_EXTENSIONS.has(ext)) {
+      cb(new HttpError(400, "Unsupported image type. Use jpg, jpeg, png, or webp."));
+      return;
+    }
+    cb(null, true);
+  },
 });
 
-app.use(cors());
-app.use(express.json());
-app.use("/uploads", express.static(path.resolve(__dirname, "..", "uploads")));
+const idParamSchema = z.object({
+  id: z.string().trim().min(1),
+});
+
+const outfitItemShape = z.object({
+  top: z.any().nullable().optional(),
+  bottom: z.any().nullable().optional(),
+  shoes: z.any().nullable().optional(),
+  accessory: z.any().nullable().optional(),
+});
+
+const saveOutfitSchema = z.object({
+  name: z.string().trim().optional(),
+  items: outfitItemShape.optional(),
+});
+
+const plannerSchema = z.object({
+  date: z.string().trim().min(1),
+  outfitId: z.string().trim().min(1),
+});
+
+const wearLogSchema = z.object({
+  outfitId: z.string().trim().optional(),
+  date: z.string().trim().optional(),
+  itemIds: z.array(z.string().trim().min(1)).optional(),
+});
+
+const recommendationSchema = z.object({
+  city: z.string().trim().optional(),
+  country: z.string().trim().optional(),
+  occasion: z.string().trim().optional(),
+});
+
+const configSchema = z.object({
+  categories: z.array(z.string().trim().min(1)).optional(),
+  occasionTags: z.array(z.string().trim().min(1)).optional(),
+  seasonTags: z.array(z.string().trim().min(1)).optional(),
+  styleTags: z.array(z.string().trim().min(1)).optional(),
+});
+
+const weatherQuerySchema = z.object({
+  city: z.string().trim().min(1),
+  country: z.string().trim().optional(),
+});
+
+const suggestionSchema = z.object({
+  occasion: z.string().trim().optional(),
+  city: z.string().trim().optional(),
+  country: z.string().trim().optional(),
+});
+
+const feedbackSchema = z.object({
+  outfitItemIds: z.array(z.string().trim().min(1)).min(1),
+  liked: z.boolean(),
+});
+
+const assistantChatSchema = z.object({
+  message: z.string().trim().min(1).max(2000),
+  history: z
+    .array(
+      z.object({
+        role: z.enum(["user", "assistant", "system"]),
+        content: z.string().trim().min(1).max(2000),
+      }),
+    )
+    .max(12)
+    .optional(),
+});
+
+function parseWithSchema(schema, input) {
+  const parsed = schema.safeParse(input);
+  if (!parsed.success) {
+    const first = parsed.error.issues[0];
+    const pathText = first.path.length ? `${first.path.join(".")}: ` : "";
+    throw new HttpError(400, `${pathText}${first.message}`);
+  }
+  return parsed.data;
+}
+
+function asyncHandler(handler) {
+  return (req, res, next) => {
+    Promise.resolve(handler(req, res, next)).catch(next);
+  };
+}
+
+async function requestOllamaChat({ message, history = [] }) {
+  const timeoutController = new AbortController();
+  const timeoutId = setTimeout(() => timeoutController.abort(), OLLAMA_TIMEOUT_MS);
+
+  try {
+    const systemPrompt = {
+      role: "system",
+      content:
+        "You are ThreadLabs Assistant. Provide concise, practical wardrobe and outfit advice based on user context. Format responses in clean Markdown with short sections, numbered or bulleted lists, and clear headings. Avoid long dense paragraphs.",
+    };
+    const messages = [systemPrompt, ...history, { role: "user", content: message }];
+    const response = await fetch(`${OLLAMA_BASE_URL}/api/chat`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        model: OLLAMA_MODEL,
+        messages,
+        stream: false,
+      }),
+      signal: timeoutController.signal,
+    });
+
+    // Older Ollama versions may not support /api/chat yet.
+    if (response.status === 404) {
+      const prompt = messages
+        .map((row) => `${row.role.toUpperCase()}: ${row.content}`)
+        .join("\n\n");
+
+      const fallbackRes = await fetch(`${OLLAMA_BASE_URL}/api/generate`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          model: OLLAMA_MODEL,
+          prompt,
+          stream: false,
+        }),
+        signal: timeoutController.signal,
+      });
+
+      let fallbackPayload = null;
+      try {
+        fallbackPayload = await fallbackRes.json();
+      } catch {
+        fallbackPayload = null;
+      }
+
+      if (!fallbackRes.ok) {
+        const reason = String(fallbackPayload?.error || "").toLowerCase();
+        if (reason.includes("model") && reason.includes("not found")) {
+          throw new HttpError(400, `Ollama model \"${OLLAMA_MODEL}\" not found. Run: ollama pull ${OLLAMA_MODEL}`);
+        }
+        throw new HttpError(502, fallbackPayload?.error || "Ollama request failed");
+      }
+
+      const text = String(fallbackPayload?.response || "").trim();
+      if (!text) {
+        throw new HttpError(502, "Ollama returned an empty response");
+      }
+      return text;
+    }
+
+    let payload = null;
+    try {
+      payload = await response.json();
+    } catch {
+      payload = null;
+    }
+
+    if (!response.ok) {
+      const reason = String(payload?.error || "").toLowerCase();
+      if (reason.includes("model") && reason.includes("not found")) {
+        throw new HttpError(400, `Ollama model \"${OLLAMA_MODEL}\" not found. Run: ollama pull ${OLLAMA_MODEL}`);
+      }
+      throw new HttpError(502, payload?.error || "Ollama request failed");
+    }
+
+    const text = String(payload?.message?.content || "").trim();
+    if (!text) {
+      throw new HttpError(502, "Ollama returned an empty response");
+    }
+    return text;
+  } catch (error) {
+    if (error?.name === "AbortError") {
+      throw new HttpError(504, "Ollama request timed out");
+    }
+    if (error instanceof HttpError) {
+      throw error;
+    }
+    throw new HttpError(502, "Unable to reach Ollama. Is it running?");
+  } finally {
+    clearTimeout(timeoutId);
+  }
+}
+
+app.disable("x-powered-by");
+app.use(
+  helmet({
+    crossOriginResourcePolicy: { policy: "cross-origin" },
+  }),
+);
+app.use(
+  cors({
+    origin(origin, callback) {
+      if (!origin || corsOriginList.includes(origin)) {
+        callback(null, true);
+        return;
+      }
+      callback(new HttpError(403, "Origin not allowed by CORS"));
+    },
+  }),
+);
+app.use(
+  "/api",
+  rateLimit({
+    windowMs: 15 * 60 * 1000,
+    max: Number(process.env.RATE_LIMIT_MAX || 300),
+    standardHeaders: true,
+    legacyHeaders: false,
+  }),
+);
+app.use(express.json({ limit: "1mb" }));
+app.use(express.urlencoded({ extended: false, limit: "1mb" }));
+app.use("/uploads", express.static(UPLOAD_DIR, { index: false, maxAge: "1d" }));
 
 app.get("/api/health", (_req, res) => {
   res.json({ ok: true });
 });
+
+app.get("/api/assistant/status", (_req, res) => {
+  res.json({
+    enabled: OLLAMA_ENABLED,
+    provider: "ollama",
+    model: OLLAMA_MODEL,
+  });
+});
+
+app.post(
+  "/api/assistant/chat",
+  asyncHandler(async (req, res) => {
+    if (!OLLAMA_ENABLED) {
+      throw new HttpError(503, "Assistant is disabled. Set OLLAMA_ENABLED=true to enable it.");
+    }
+
+    const payload = parseWithSchema(assistantChatSchema, req.body || {});
+    const reply = await requestOllamaChat({
+      message: payload.message,
+      history: payload.history || [],
+    });
+
+    return res.json({
+      reply,
+      model: OLLAMA_MODEL,
+      provider: "ollama",
+    });
+  }),
+);
 
 app.get("/api/items", (_req, res) => {
   const db = readDb();
@@ -51,67 +328,83 @@ app.get("/api/outfits/saved", (_req, res) => {
   res.json(outfits);
 });
 
-app.post("/api/outfits/saved", (req, res) => {
-  const payload = req.body || {};
-  const name = String(payload.name || "").trim() || "Untitled Outfit";
-  const normalized = normalizeOutfitItems(payload.items);
+app.post(
+  "/api/outfits/saved",
+  asyncHandler(async (req, res) => {
+    const payload = parseWithSchema(saveOutfitSchema, req.body || {});
+    const name = String(payload.name || "").trim() || "Untitled Outfit";
+    const normalized = normalizeOutfitItems(payload.items);
 
-  const db = readDb();
-  const next = {
-    id: uuidv4(),
-    name,
-    items: normalized,
-    createdAt: new Date().toISOString(),
-  };
+    const next = await mutateDb((db) => {
+      const row = {
+        id: uuidv4(),
+        name,
+        items: normalized,
+        createdAt: new Date().toISOString(),
+      };
+      db.outfits.push(row);
+      return row;
+    });
 
-  db.outfits.push(next);
-  writeDb(db);
+    return res.status(201).json(next);
+  }),
+);
 
-  return res.status(201).json(next);
-});
+app.put(
+  "/api/outfits/saved/:id",
+  asyncHandler(async (req, res) => {
+    const { id } = parseWithSchema(idParamSchema, req.params);
+    const payload = parseWithSchema(saveOutfitSchema, req.body || {});
 
-app.put("/api/outfits/saved/:id", (req, res) => {
-  const db = readDb();
-  const idx = db.outfits.findIndex((outfit) => outfit.id === req.params.id);
-  if (idx === -1) {
-    return res.status(404).json({ error: "Outfit not found" });
-  }
+    const next = await mutateDb((db) => {
+      const idx = db.outfits.findIndex((outfit) => outfit.id === id);
+      if (idx === -1) {
+        throw new HttpError(404, "Outfit not found");
+      }
 
-  const payload = req.body || {};
-  const current = db.outfits[idx];
-  const next = {
-    ...current,
-    name: String(payload.name || current.name || "Untitled Outfit").trim() || "Untitled Outfit",
-    items: normalizeOutfitItems(payload.items || current.items),
-    updatedAt: new Date().toISOString(),
-  };
+      const current = db.outfits[idx];
+      const updated = {
+        ...current,
+        name: String(payload.name || current.name || "Untitled Outfit").trim() || "Untitled Outfit",
+        items: normalizeOutfitItems(payload.items || current.items),
+        updatedAt: new Date().toISOString(),
+      };
+      db.outfits[idx] = updated;
+      return updated;
+    });
 
-  db.outfits[idx] = next;
-  writeDb(db);
-  return res.json(next);
-});
+    return res.json(next);
+  }),
+);
 
-app.post("/api/outfits/saved/:id/duplicate", (req, res) => {
-  const db = readDb();
-  const found = db.outfits.find((outfit) => outfit.id === req.params.id);
-  if (!found) {
-    return res.status(404).json({ error: "Outfit not found" });
-  }
+app.post(
+  "/api/outfits/saved/:id/duplicate",
+  asyncHandler(async (req, res) => {
+    const { id } = parseWithSchema(idParamSchema, req.params);
+    const payload = parseWithSchema(saveOutfitSchema, req.body || {});
 
-  const payload = req.body || {};
-  const next = {
-    ...found,
-    id: uuidv4(),
-    name: String(payload.name || `${found.name} Copy`).trim() || `${found.name} Copy`,
-    items: normalizeOutfitItems(payload.items || found.items),
-    createdAt: new Date().toISOString(),
-    duplicatedFromId: found.id,
-  };
+    const next = await mutateDb((db) => {
+      const found = db.outfits.find((outfit) => outfit.id === id);
+      if (!found) {
+        throw new HttpError(404, "Outfit not found");
+      }
 
-  db.outfits.push(next);
-  writeDb(db);
-  return res.status(201).json(next);
-});
+      const row = {
+        ...found,
+        id: uuidv4(),
+        name: String(payload.name || `${found.name} Copy`).trim() || `${found.name} Copy`,
+        items: normalizeOutfitItems(payload.items || found.items),
+        createdAt: new Date().toISOString(),
+        duplicatedFromId: found.id,
+      };
+
+      db.outfits.push(row);
+      return row;
+    });
+
+    return res.status(201).json(next);
+  }),
+);
 
 app.get("/api/planner", (_req, res) => {
   const db = readDb();
@@ -125,81 +418,105 @@ app.get("/api/planner", (_req, res) => {
   return res.json(rows);
 });
 
-app.post("/api/planner", (req, res) => {
-  const db = readDb();
-  const date = normalizeDateKey(req.body?.date);
-  const outfitId = String(req.body?.outfitId || "").trim();
-  if (!date || !outfitId) {
-    return res.status(400).json({ error: "date and outfitId are required" });
-  }
+app.post(
+  "/api/planner",
+  asyncHandler(async (req, res) => {
+    const payload = parseWithSchema(plannerSchema, req.body || {});
+    const date = normalizeDateKey(payload.date);
+    const outfitId = payload.outfitId;
+    if (!date) {
+      throw new HttpError(400, "date must be a valid date");
+    }
 
-  const outfit = db.outfits.find((row) => row.id === outfitId);
-  if (!outfit) {
-    return res.status(404).json({ error: "Outfit not found" });
-  }
+    const next = await mutateDb((db) => {
+      const outfit = db.outfits.find((row) => row.id === outfitId);
+      if (!outfit) {
+        throw new HttpError(404, "Outfit not found");
+      }
 
-  const existing = db.outfitPlans.find((plan) => plan.date === date);
-  const recentOutfits = db.outfitPlans
-    .filter((plan) => plan.date !== date)
-    .sort((a, b) => String(b.date).localeCompare(String(a.date)))
-    .slice(0, 7)
-    .map((plan) => plan.outfitId);
+      const existing = db.outfitPlans.find((plan) => plan.date === date);
+      const recentOutfits = db.outfitPlans
+        .filter((plan) => plan.date !== date)
+        .sort((a, b) => String(b.date).localeCompare(String(a.date)))
+        .slice(0, 7)
+        .map((plan) => plan.outfitId);
 
-  if (recentOutfits.includes(outfitId)) {
-    return res.status(409).json({ error: "Avoid repeats: this outfit is planned recently" });
-  }
+      if (recentOutfits.includes(outfitId)) {
+        throw new HttpError(409, "Avoid repeats: this outfit is planned recently");
+      }
 
-  const next = {
-    id: existing?.id || uuidv4(),
-    date,
-    outfitId,
-    createdAt: existing?.createdAt || new Date().toISOString(),
-    updatedAt: new Date().toISOString(),
-  };
+      const row = {
+        id: existing?.id || uuidv4(),
+        date,
+        outfitId,
+        createdAt: existing?.createdAt || new Date().toISOString(),
+        updatedAt: new Date().toISOString(),
+      };
 
-  if (existing) {
-    db.outfitPlans = db.outfitPlans.map((plan) => (plan.id === existing.id ? next : plan));
-  } else {
-    db.outfitPlans.push(next);
-  }
+      if (existing) {
+        db.outfitPlans = db.outfitPlans.map((plan) => (plan.id === existing.id ? row : plan));
+      } else {
+        db.outfitPlans.push(row);
+      }
 
-  writeDb(db);
-  return res.status(existing ? 200 : 201).json(next);
-});
+      return {
+        status: existing ? 200 : 201,
+        row,
+      };
+    });
 
-app.delete("/api/planner/:id", (req, res) => {
-  const db = readDb();
-  const before = db.outfitPlans.length;
-  db.outfitPlans = db.outfitPlans.filter((row) => row.id !== req.params.id);
-  if (db.outfitPlans.length === before) {
-    return res.status(404).json({ error: "Plan not found" });
-  }
-  writeDb(db);
-  return res.status(204).send();
-});
+    return res.status(next.status).json(next.row);
+  }),
+);
 
-app.post("/api/wear-log", (req, res) => {
-  const db = readDb();
-  const outfitId = String(req.body?.outfitId || "").trim();
-  const date = normalizeDateKey(req.body?.date || new Date().toISOString());
-  const itemIds = Array.isArray(req.body?.itemIds) ? req.body.itemIds.filter(Boolean) : [];
+app.delete(
+  "/api/planner/:id",
+  asyncHandler(async (req, res) => {
+    const { id } = parseWithSchema(idParamSchema, req.params);
 
-  if (!outfitId && itemIds.length === 0) {
-    return res.status(400).json({ error: "outfitId or itemIds is required" });
-  }
+    await mutateDb((db) => {
+      const before = db.outfitPlans.length;
+      db.outfitPlans = db.outfitPlans.filter((row) => row.id !== id);
+      if (db.outfitPlans.length === before) {
+        throw new HttpError(404, "Plan not found");
+      }
+    });
 
-  const next = {
-    id: uuidv4(),
-    outfitId: outfitId || null,
-    itemIds,
-    date,
-    createdAt: new Date().toISOString(),
-  };
+    return res.status(204).send();
+  }),
+);
 
-  db.wearLogs.push(next);
-  writeDb(db);
-  return res.status(201).json(next);
-});
+app.post(
+  "/api/wear-log",
+  asyncHandler(async (req, res) => {
+    const payload = parseWithSchema(wearLogSchema, req.body || {});
+    const outfitId = String(payload.outfitId || "").trim();
+    const date = normalizeDateKey(payload.date || new Date().toISOString());
+    const itemIds = Array.isArray(payload.itemIds) ? payload.itemIds.filter(Boolean) : [];
+
+    if (!date) {
+      throw new HttpError(400, "date must be a valid date");
+    }
+    if (!outfitId && itemIds.length === 0) {
+      throw new HttpError(400, "outfitId or itemIds is required");
+    }
+
+    const next = await mutateDb((db) => {
+      const row = {
+        id: uuidv4(),
+        outfitId: outfitId || null,
+        itemIds,
+        date,
+        createdAt: new Date().toISOString(),
+      };
+
+      db.wearLogs.push(row);
+      return row;
+    });
+
+    return res.status(201).json(next);
+  }),
+);
 
 app.get("/api/analytics", (_req, res) => {
   const db = readDb();
@@ -268,12 +585,14 @@ app.get("/api/analytics", (_req, res) => {
   });
 });
 
-app.post("/api/recommendation/daily", async (req, res) => {
-  try {
+app.post(
+  "/api/recommendation/daily",
+  asyncHandler(async (req, res) => {
+    const payload = parseWithSchema(recommendationSchema, req.body || {});
     const db = readDb();
-    const city = String(req.body?.city || "").trim();
-    const country = String(req.body?.country || "").trim();
-    const occasion = String(req.body?.occasion || "casual").trim() || "casual";
+    const city = String(payload.city || "").trim();
+    const country = String(payload.country || "").trim();
+    const occasion = String(payload.occasion || "casual").trim() || "casual";
 
     let weather = null;
     if (city) {
@@ -306,10 +625,8 @@ app.post("/api/recommendation/daily", async (req, res) => {
       missingItemSuggestions,
       avoidedRecentlyUsedItems: recentItemIds.length,
     });
-  } catch (error) {
-    return res.status(500).json({ error: error.message || "Daily recommendation failed" });
-  }
-});
+  }),
+);
 
 function pickRandom(list) {
   if (!Array.isArray(list) || list.length === 0) {
@@ -374,7 +691,7 @@ function getOutfitItemIds(outfit) {
     .filter(Boolean);
 }
 
-function buildMissingItemSuggestions(items, config, missingCategories, occasion) {
+function buildMissingItemSuggestions(items, _config, missingCategories, occasion) {
   const nextMissing = Array.isArray(missingCategories) ? missingCategories : [];
 
   return nextMissing.map((category) => {
@@ -432,30 +749,38 @@ app.get("/api/config", (_req, res) => {
   });
 });
 
-app.put("/api/config", (req, res) => {
-  const db = readDb();
-  const nextConfig = sanitizeConfig(req.body || {});
+app.put(
+  "/api/config",
+  asyncHandler(async (req, res) => {
+    const payload = parseWithSchema(configSchema, req.body || {});
 
-  if (
-    nextConfig.categories.length === 0 ||
-    nextConfig.occasionTags.length === 0 ||
-    nextConfig.seasonTags.length === 0
-  ) {
-    return res.status(400).json({ error: "Categories, occasions, and seasons need at least one option" });
-  }
+    const next = await mutateDb((db) => {
+      const nextConfig = sanitizeConfig(payload || {});
+      if (
+        nextConfig.categories.length === 0 ||
+        nextConfig.occasionTags.length === 0 ||
+        nextConfig.seasonTags.length === 0
+      ) {
+        throw new HttpError(400, "Categories, occasions, and seasons need at least one option");
+      }
 
-  db.config = nextConfig;
-  writeDb(db);
-  return res.json({
-    ...db.config,
-    lockedDefaults: DEFAULT_CONFIG,
-  });
-});
+      db.config = nextConfig;
+      return {
+        ...db.config,
+        lockedDefaults: DEFAULT_CONFIG,
+      };
+    });
 
-app.post("/api/items", upload.single("image"), async (req, res) => {
-  try {
+    return res.json(next);
+  }),
+);
+
+app.post(
+  "/api/items",
+  upload.single("image"),
+  asyncHandler(async (req, res) => {
     if (!req.file) {
-      return res.status(400).json({ error: "Image is required" });
+      throw new HttpError(400, "Image is required");
     }
 
     const name = String(req.body.name || "").trim();
@@ -463,93 +788,100 @@ app.post("/api/items", upload.single("image"), async (req, res) => {
     const seasons = parseTags(req.body.seasons);
     const occasions = parseTags(req.body.occasions);
     const styleTags = parseTags(req.body.styleTags);
-    const warmthLevel = Number(req.body.warmthLevel || 3);
+    const warmthLevel = Math.max(1, Math.min(5, Number(req.body.warmthLevel || 3)));
 
     if (!name || !category) {
-      return res.status(400).json({ error: "Name and category are required" });
-    }
-
-    const db = readDb();
-    if (!db.config.categories.includes(category)) {
-      return res.status(400).json({ error: "Invalid category for current config" });
+      throw new HttpError(400, "Name and category are required");
     }
 
     const imageUrl = `/uploads/${req.file.filename}`;
-    const embedding = await getImageEmbedding({
-      imagePath: imageUrl,
-      category,
-      name,
-      seasons,
-      occasions,
+
+    const item = await mutateDb(async (db) => {
+      if (!db.config.categories.includes(category)) {
+        throw new HttpError(400, "Invalid category for current config");
+      }
+
+      const embedding = await getImageEmbedding({
+        imagePath: imageUrl,
+        category,
+        name,
+        seasons,
+        occasions,
+      });
+
+      const row = {
+        id: uuidv4(),
+        name,
+        category,
+        seasons,
+        occasions,
+        styleTags,
+        warmthLevel,
+        imageUrl,
+        embedding,
+        embeddingMeta: getEmbeddingMetadata(),
+        createdAt: new Date().toISOString(),
+      };
+      db.items.push(row);
+      return row;
     });
 
-    const item = {
-      id: uuidv4(),
-      name,
-      category,
-      seasons,
-      occasions,
-      styleTags,
-      warmthLevel,
-      imageUrl,
-      embedding,
-      createdAt: new Date().toISOString(),
-    };
-    db.items.push(item);
-    writeDb(db);
-
     return res.status(201).json(item);
-  } catch (error) {
-    return res.status(500).json({ error: error.message || "Failed to create item" });
-  }
-});
+  }),
+);
 
-app.delete("/api/items/:id", (req, res) => {
-  const db = readDb();
-  const found = db.items.find((item) => item.id === req.params.id);
-  if (!found) {
-    return res.status(404).json({ error: "Item not found" });
-  }
+app.delete(
+  "/api/items/:id",
+  asyncHandler(async (req, res) => {
+    const { id } = parseWithSchema(idParamSchema, req.params);
 
-  db.items = db.items.filter((item) => item.id !== req.params.id);
-  writeDb(db);
+    const found = await mutateDb((db) => {
+      const row = db.items.find((item) => item.id === id);
+      if (!row) {
+        throw new HttpError(404, "Item not found");
+      }
 
-  if (found.imageUrl) {
-    const imagePath = path.resolve(__dirname, "..", found.imageUrl.replace(/^\//, ""));
-    if (fs.existsSync(imagePath)) {
-      fs.unlinkSync(imagePath);
+      db.items = db.items.filter((item) => item.id !== id);
+      return row;
+    });
+
+    if (found.imageUrl) {
+      const imagePath = path.resolve(UPLOAD_DIR, path.basename(found.imageUrl));
+      if (fs.existsSync(imagePath)) {
+        fs.unlinkSync(imagePath);
+      }
     }
-  }
 
-  return res.status(204).send();
-});
+    return res.status(204).send();
+  }),
+);
 
-app.get("/api/weather", async (req, res) => {
-  try {
-    const city = String(req.query.city || "").trim();
-    const country = String(req.query.country || "").trim();
-    const weather = await getWeatherByLocation({ city, country });
+app.get(
+  "/api/weather",
+  asyncHandler(async (req, res) => {
+    const query = parseWithSchema(weatherQuerySchema, req.query || {});
+    const weather = await getWeatherByLocation({ city: query.city, country: query.country || "" });
     return res.json(weather);
-  } catch (error) {
-    return res.status(400).json({ error: error.message || "Weather lookup failed" });
-  }
-});
+  }),
+);
 
-app.post("/api/suggestions", async (req, res) => {
-  try {
-    const { occasion, city, country } = req.body || {};
+app.post(
+  "/api/suggestions",
+  asyncHandler(async (req, res) => {
+    const payload = parseWithSchema(suggestionSchema, req.body || {});
     const db = readDb();
 
     let weather = null;
-    if (city) {
+    if (payload.city) {
       weather = await getWeatherByLocation({
-        city: String(city),
-        country: String(country || ""),
+        city: String(payload.city),
+        country: String(payload.country || ""),
       });
     }
 
+    const occasion = String(payload.occasion || "").trim() || null;
     const result = buildSuggestions(db.items, {
-      occasion: String(occasion || "").trim() || null,
+      occasion,
       weather,
       feedback: db.feedback,
     });
@@ -558,7 +890,7 @@ app.post("/api/suggestions", async (req, res) => {
       db.items,
       db.config,
       result.missingCategories,
-      String(occasion || "").trim() || null,
+      occasion,
     );
 
     return res.json({
@@ -566,12 +898,10 @@ app.post("/api/suggestions", async (req, res) => {
       ...result,
       missingItemSuggestions,
     });
-  } catch (error) {
-    return res.status(500).json({ error: error.message || "Suggestion generation failed" });
-  }
-});
+  }),
+);
 
-app.get("/api/outfits/random", (req, res) => {
+app.get("/api/outfits/random", (_req, res) => {
   const db = readDb();
   const items = db.items || [];
 
@@ -613,25 +943,44 @@ app.get("/api/outfits/random", (req, res) => {
   });
 });
 
-app.post("/api/feedback", (req, res) => {
-  const { outfitItemIds, liked } = req.body || {};
-  if (!Array.isArray(outfitItemIds) || typeof liked !== "boolean") {
-    return res.status(400).json({ error: "outfitItemIds and liked are required" });
+app.post(
+  "/api/feedback",
+  asyncHandler(async (req, res) => {
+    const payload = parseWithSchema(feedbackSchema, req.body || {});
+
+    await mutateDb((db) => {
+      db.feedback.push({
+        id: uuidv4(),
+        outfitItemIds: payload.outfitItemIds,
+        liked: payload.liked,
+        createdAt: new Date().toISOString(),
+      });
+    });
+
+    return res.status(201).json({ ok: true });
+  }),
+);
+
+app.use((error, _req, res, _next) => {
+  if (error instanceof multer.MulterError && error.code === "LIMIT_FILE_SIZE") {
+    return res.status(400).json({ error: "Image is too large. Maximum size is 8MB." });
   }
 
-  const db = readDb();
-  db.feedback.push({
-    id: uuidv4(),
-    outfitItemIds,
-    liked,
-    createdAt: new Date().toISOString(),
+  if (error instanceof HttpError) {
+    return res.status(error.status).json({ error: error.message });
+  }
+
+  return res.status(500).json({ error: error?.message || "Internal server error" });
+});
+
+export { app };
+
+const isDirectRun =
+  process.argv[1] && pathToFileURL(process.argv[1]).href === import.meta.url;
+
+if (isDirectRun) {
+  app.listen(PORT, () => {
+    // eslint-disable-next-line no-console
+    console.log(`threadlabs API listening on http://localhost:${PORT}`);
   });
-  writeDb(db);
-
-  return res.status(201).json({ ok: true });
-});
-
-app.listen(PORT, () => {
-  // eslint-disable-next-line no-console
-  console.log(`threadlabs API listening on http://localhost:${PORT}`);
-});
+}

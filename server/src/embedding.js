@@ -2,6 +2,17 @@ import crypto from "node:crypto";
 
 const VECTOR_SIZE = 24;
 
+function embeddingProvider() {
+  const explicit = String(process.env.EMBEDDING_PROVIDER || "").trim().toLowerCase();
+  if (explicit === "deterministic" || explicit === "hash") {
+    return "deterministic";
+  }
+  if (explicit === "external" || explicit === "hosted") {
+    return "external";
+  }
+  return process.env.HF_API_TOKEN ? "external" : "deterministic";
+}
+
 function hashToFloats(input, count) {
   const digest = crypto.createHash("sha256").update(input).digest();
   const values = [];
@@ -18,10 +29,10 @@ function normalize(vector) {
 }
 
 export async function getImageEmbedding({ imagePath, category, name, seasons, occasions }) {
-  const apiToken = process.env.HF_API_TOKEN;
+  const provider = embeddingProvider();
 
   // Placeholder for hosted image embedding. In MVP we use deterministic vectors unless API wiring is added.
-  if (apiToken) {
+  if (provider === "external") {
     const hostedSeed = `${imagePath}:${category}:${name}:${seasons.join("|")}:${occasions.join("|")}`;
     return normalize(hashToFloats(`hosted:${hostedSeed}`, VECTOR_SIZE));
   }
@@ -39,4 +50,13 @@ export function cosineSimilarity(a, b) {
     dot += a[i] * b[i];
   }
   return dot;
+}
+
+export function getEmbeddingMetadata() {
+  const provider = embeddingProvider();
+  return {
+    provider,
+    model: provider === "external" ? (process.env.EMBEDDING_MODEL || "hf-hosted-placeholder") : "deterministic-hash-v1",
+    version: "1",
+  };
 }

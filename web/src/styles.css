@@ -359,6 +359,34 @@ button:disabled,
   border-radius: 8px;
 }
 
+.assistant-user-text {
+  margin: 0.2rem 0 0;
+  white-space: pre-wrap;
+}
+
+.assistant-markdown {
+  margin-top: 0.2rem;
+  line-height: 1.5;
+}
+
+.assistant-markdown p {
+  margin: 0.35rem 0;
+}
+
+.assistant-markdown ul,
+.assistant-markdown ol {
+  margin: 0.35rem 0;
+  padding-left: 1.1rem;
+}
+
+.assistant-markdown li {
+  margin: 0.2rem 0;
+}
+
+.assistant-markdown strong {
+  font-weight: 700;
+}
+
 .saved-slot p {
   margin: 0.3rem 0 0;
   font-size: 0.82rem;

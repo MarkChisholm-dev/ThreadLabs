@@ -1,7 +1,15 @@
 import fs from "node:fs";
 import path from "node:path";
 
-const DB_PATH = path.resolve(process.cwd(), "data", "db.json");
+let writeQueue = Promise.resolve();
+
+function getDbPath() {
+  if (process.env.DB_PATH) {
+    return path.resolve(process.env.DB_PATH);
+  }
+  return path.resolve(process.cwd(), "data", "db.json");
+}
+
 export const DEFAULT_CONFIG = {
   categories: ["top", "bottom", "shoes", "accessory"],
   occasionTags: ["casual", "office", "date-night", "formal", "athleisure"],
@@ -43,25 +51,58 @@ function normalizeDb(db) {
 }
 
 function ensureDbFile() {
-  if (!fs.existsSync(DB_PATH)) {
-    fs.mkdirSync(path.dirname(DB_PATH), { recursive: true });
+  const dbPath = getDbPath();
+  if (!fs.existsSync(dbPath)) {
+    fs.mkdirSync(path.dirname(dbPath), { recursive: true });
     fs.writeFileSync(
-      DB_PATH,
+      dbPath,
       JSON.stringify(normalizeDb({}), null, 2),
       "utf-8",
     );
   }
 }
 
+function writeDbAtomic(dbPath, data) {
+  const tmpPath = `${dbPath}.tmp`;
+  fs.writeFileSync(tmpPath, data, "utf-8");
+  fs.renameSync(tmpPath, dbPath);
+}
+
 export function readDb() {
   ensureDbFile();
-  const raw = fs.readFileSync(DB_PATH, "utf-8");
-  const db = normalizeDb(JSON.parse(raw));
-  fs.writeFileSync(DB_PATH, JSON.stringify(db, null, 2), "utf-8");
+  const dbPath = getDbPath();
+  const raw = fs.readFileSync(dbPath, "utf-8");
+  let parsed = {};
+  try {
+    parsed = JSON.parse(raw);
+  } catch {
+    parsed = {};
+  }
+  const db = normalizeDb(parsed);
   return db;
 }
 
 export function writeDb(nextDb) {
   ensureDbFile();
-  fs.writeFileSync(DB_PATH, JSON.stringify(nextDb, null, 2), "utf-8");
+  const dbPath = getDbPath();
+  writeDbAtomic(dbPath, JSON.stringify(normalizeDb(nextDb), null, 2));
+}
+
+export async function mutateDb(mutator) {
+  const runMutation = async () => {
+    const current = readDb();
+    const before = JSON.stringify(current);
+    const result = await mutator(current);
+    const normalized = normalizeDb(current);
+    const after = JSON.stringify(normalized);
+
+    if (before !== after) {
+      writeDb(normalized);
+    }
+
+    return result;
+  };
+
+  writeQueue = writeQueue.then(runMutation, runMutation);
+  return writeQueue;
 }

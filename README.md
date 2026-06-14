@@ -87,6 +87,12 @@ ThreadLabs combines a visual outfit recommender, a graph-based builder, weather-
 
 ![Diagnostics mode](screenshots/diagnostic.png)
 
+### Optional AI assistant (Ollama)
+
+- Local assistant panel (home page)
+- Powered by local Ollama model when enabled
+- Disabled by default, safe fallback when not configured
+
 ## Tech Stack
 
 - Frontend: React + Vite + React Router
@@ -108,6 +114,14 @@ threadlabs/
 
 ## Run locally
 
+### One-command setup and run (all platforms)
+
+From the project root:
+
+```bash
+npm run setup:run
+```
+
 ### Windows one-click start
 
 From the project root, double-click `install-and-run.bat`.
@@ -119,6 +133,14 @@ install-and-run.bat
 ```
 
 It will install dependencies and start both the API server and web app.
+
+### macOS and Linux one-click start
+
+From the project root:
+
+```bash
+./install-and-run.sh
+```
 
 1. Install dependencies
 
@@ -137,6 +159,13 @@ npm run dev
 - App: http://localhost:5173
 - API: http://localhost:4000
 
+### Troubleshooting quick checks
+
+- Verify Node and npm are installed: `node -v` and `npm -v`
+- If ports are busy, stop old processes and rerun
+- If API calls fail in browser, ensure backend is running on `http://localhost:4000`
+- For CORS in custom environments, set `CORS_ORIGINS` in `server/.env`
+
 ## Build
 
 ```bash
@@ -148,6 +177,14 @@ npm run build
 Copy `server/.env.example` to `server/.env` if needed.
 
 - `PORT` (default: `4000`)
+- `CORS_ORIGINS` (comma-separated allowed origins)
+- `RATE_LIMIT_MAX` (API requests per 15 min window, default `300`)
+- `EMBEDDING_PROVIDER` (`deterministic` or `external`)
+- `EMBEDDING_MODEL` (metadata label for external provider)
+- `OLLAMA_ENABLED` (`true` or `false`, default `false`)
+- `OLLAMA_BASE_URL` (default `http://127.0.0.1:11434`)
+- `OLLAMA_MODEL` (default `llama3.1:8b`)
+- `OLLAMA_TIMEOUT_MS` (assistant request timeout in ms, default `30000`)
 - No API keys are required for local setup
 
 ## API Highlights
@@ -168,3 +205,5 @@ Copy `server/.env.example` to `server/.env` if needed.
 - `GET /api/analytics`
 - `POST /api/recommendation/daily`
 - `GET /api/health`
+- `GET /api/assistant/status`
+- `POST /api/assistant/chat`

@@ -1,6 +1,8 @@
 import { cosineSimilarity } from "./embedding.js";
 
 const BASE_REQUIRED = ["top", "bottom", "shoes"];
+const MAX_PER_CATEGORY = 60;
+const MAX_COMBINATIONS = 12000;
 
 function byCategory(items, category) {
   return items.filter((item) => item.category === category);
@@ -31,7 +33,7 @@ function weatherPenalty(item, temperatureC) {
   return 0;
 }
 
-function compatibilityScore(items) {
+function compatibilityScore(items, similarity = cosineSimilarity) {
   const pairs = [
     [items.top, items.bottom],
     [items.top, items.shoes],
@@ -40,16 +42,26 @@ function compatibilityScore(items) {
 
   let score = 0;
   for (const [a, b] of pairs) {
-    score += cosineSimilarity(a.embedding, b.embedding);
+    score += similarity(a, b);
   }
 
   if (items.accessory) {
     score +=
-      cosineSimilarity(items.accessory.embedding, items.top.embedding) * 0.4 +
-      cosineSimilarity(items.accessory.embedding, items.bottom.embedding) * 0.3;
+      similarity(items.accessory, items.top) * 0.4 +
+      similarity(items.accessory, items.bottom) * 0.3;
   }
 
   return score;
+}
+
+function limitedCandidates(list, max) {
+  if (!Array.isArray(list)) {
+    return [];
+  }
+  if (list.length <= max) {
+    return list;
+  }
+  return list.slice(0, max);
 }
 
 export function buildSuggestions(
@@ -64,11 +76,39 @@ export function buildSuggestions(
   },
 ) {
   const excluded = new Set(Array.isArray(avoidItemIds) ? avoidItemIds : []);
+  const pairCache = new Map();
 
-  const topItems = byCategory(items, "top").filter((i) => matchesOccasion(i, occasion));
-  const bottomItems = byCategory(items, "bottom").filter((i) => matchesOccasion(i, occasion));
-  const shoeItems = byCategory(items, "shoes").filter((i) => matchesOccasion(i, occasion));
-  const accessoryItems = byCategory(items, "accessory").filter((i) => matchesOccasion(i, occasion));
+  function pairSimilarity(a, b) {
+    if (!a || !b) {
+      return 0;
+    }
+    const left = String(a.id || "");
+    const right = String(b.id || "");
+    const key = left < right ? `${left}|${right}` : `${right}|${left}`;
+    if (pairCache.has(key)) {
+      return pairCache.get(key);
+    }
+    const value = cosineSimilarity(a.embedding, b.embedding);
+    pairCache.set(key, value);
+    return value;
+  }
+
+  const topItems = limitedCandidates(
+    byCategory(items, "top").filter((i) => matchesOccasion(i, occasion)),
+    MAX_PER_CATEGORY,
+  );
+  const bottomItems = limitedCandidates(
+    byCategory(items, "bottom").filter((i) => matchesOccasion(i, occasion)),
+    MAX_PER_CATEGORY,
+  );
+  const shoeItems = limitedCandidates(
+    byCategory(items, "shoes").filter((i) => matchesOccasion(i, occasion)),
+    MAX_PER_CATEGORY,
+  );
+  const accessoryItems = limitedCandidates(
+    byCategory(items, "accessory").filter((i) => matchesOccasion(i, occasion)),
+    MAX_PER_CATEGORY,
+  );
 
   if (topItems.length === 0 || bottomItems.length === 0 || shoeItems.length === 0) {
     return {
@@ -80,6 +120,7 @@ export function buildSuggestions(
   }
 
   const outfits = [];
+  let evaluated = 0;
 
   function feedbackBoost(selectedItems, feedbackRows) {
     if (!Array.isArray(feedbackRows) || feedbackRows.length === 0) {
@@ -109,14 +150,17 @@ export function buildSuggestions(
   for (const top of topItems) {
     for (const bottom of bottomItems) {
       for (const shoes of shoeItems) {
+        evaluated += 1;
+        if (evaluated > MAX_COMBINATIONS) {
+          break;
+        }
+
         const base = { top, bottom, shoes };
         let bestAccessory = null;
         let bestAccessoryScore = -Infinity;
 
         for (const accessory of accessoryItems) {
-          const accScore =
-            cosineSimilarity(accessory.embedding, top.embedding) +
-            cosineSimilarity(accessory.embedding, bottom.embedding);
+          const accScore = pairSimilarity(accessory, top) + pairSimilarity(accessory, bottom);
           if (accScore > bestAccessoryScore) {
             bestAccessoryScore = accScore;
             bestAccessory = accessory;
@@ -162,7 +206,7 @@ export function buildSuggestions(
           .filter(Boolean)
           .reduce((sum, item) => sum + weatherPenalty(item, weather?.temperatureC), 0);
 
-        const score = compatibilityScore(selected) + weatherAdjustments + feedbackBoost(selected, feedback);
+        const score = compatibilityScore(selected, pairSimilarity) + weatherAdjustments + feedbackBoost(selected, feedback);
         const lowConfidence = score < 0.4;
 
         outfits.push({
@@ -174,6 +218,12 @@ export function buildSuggestions(
           },
         });
       }
+      if (evaluated > MAX_COMBINATIONS) {
+        break;
+      }
+    }
+    if (evaluated > MAX_COMBINATIONS) {
+      break;
     }
   }
 
