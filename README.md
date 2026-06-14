@@ -108,6 +108,18 @@ threadlabs/
 
 ## Run locally
 
+### Windows one-click start
+
+From the project root, double-click `install-and-run.bat`.
+
+Or run it from Command Prompt:
+
+```bat
+install-and-run.bat
+```
+
+It will install dependencies and start both the API server and web app.
+
 1. Install dependencies
 
 ```bash
