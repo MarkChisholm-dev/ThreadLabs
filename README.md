@@ -93,6 +93,39 @@ ThreadLabs combines a visual outfit recommender, a graph-based builder, weather-
 - Powered by local Ollama model when enabled
 - Disabled by default, safe fallback when not configured
 
+#### Enable AI assistant locally
+
+1. Install Ollama: https://ollama.com/download
+2. Start Ollama:
+
+```bash
+ollama serve
+```
+
+3. Pull a model (default project model):
+
+```bash
+ollama pull llama3.1:8b
+```
+
+4. In `server/.env`, set:
+
+```dotenv
+OLLAMA_ENABLED=true
+OLLAMA_BASE_URL=http://127.0.0.1:11434
+OLLAMA_MODEL=llama3.1:8b
+OLLAMA_TIMEOUT_MS=30000
+```
+
+5. Restart the API server after updating env values.
+
+#### Assistant behavior
+
+- The UI assistant appears on the home page.
+- If disabled, the panel stays visible and explains how to enable it.
+- Backend supports both Ollama chat and older generate endpoints for compatibility.
+- Responses are rendered as Markdown for cleaner lists and formatting.
+
 ## Tech Stack
 
 - Frontend: React + Vite + React Router
@@ -165,6 +198,8 @@ npm run dev
 - If ports are busy, stop old processes and rerun
 - If API calls fail in browser, ensure backend is running on `http://localhost:4000`
 - For CORS in custom environments, set `CORS_ORIGINS` in `server/.env`
+- If assistant fails, verify Ollama is running: `curl http://127.0.0.1:11434/api/tags`
+- If model is missing, run: `ollama pull llama3.1:8b` (or your configured model)
 
 ## Build
 
@@ -207,3 +242,8 @@ Copy `server/.env.example` to `server/.env` if needed.
 - `GET /api/health`
 - `GET /api/assistant/status`
 - `POST /api/assistant/chat`
+
+### Assistant API notes
+
+- `GET /api/assistant/status`: reports whether assistant is enabled and which model is configured.
+- `POST /api/assistant/chat`: accepts `message` and optional `history`, returns assistant reply text.
