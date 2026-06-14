@@ -22,6 +22,10 @@ ThreadLabs combines a visual outfit recommender, a graph-based builder, weather-
 
 ![ThreadLabs diagnostics panel](screenshots/diagnostic.png)
 
+### AI assistant
+
+![ThreadLabs AI assistant panel](screenshots/AI.png)
+
 ## What it is
 
 - Photo-first wardrobe manager
@@ -92,6 +96,8 @@ ThreadLabs combines a visual outfit recommender, a graph-based builder, weather-
 - Local assistant panel (home page)
 - Powered by local Ollama model when enabled
 - Disabled by default, safe fallback when not configured
+
+![AI assistant panel](screenshots/AI.png)
 
 #### Enable AI assistant locally
 
